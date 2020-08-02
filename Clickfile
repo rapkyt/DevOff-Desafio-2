@@ -1,0 +1,567 @@
+"""
+Clickfile: Loot Crate.
+
+TODO: Write project short description.
+
+NOTE: This file is meant to automate reptitive tasks only!
+      It is not intended as a replacement for any CLI.
+
+Usage:
+    klak COMMAND
+    klak COMMAND --help
+    klak COMMAND SUB_COMMAND --help
+
+Options:
+  -v, --version     Print current version.
+  --help            Show this message and exit.
+
+"""
+import configparser
+import os
+import sys
+import subprocess
+import shutil
+import urllib
+
+import click
+import copy
+import enum
+import secrets
+from glob import glob
+from typing import List, Tuple
+from contextlib import contextmanager
+from klak.cli import cli
+from pathlib import Path
+from urllib import request, parse
+
+
+# -------------------------------------
+# Settings
+# -------------------------------------
+
+
+# Cookiecutter Values
+# -------------------------------------
+
+
+PROJECT_SLUG = "devoff"
+
+
+# Paths
+# -------------------------------------
+
+
+CWD = Path.cwd()
+SCRIPTS = CWD.joinpath("sh")
+DJANGO = CWD.joinpath("django")
+PROJECT = DJANGO.joinpath("project")
+
+
+CONFIG = configparser.ConfigParser()
+
+# Enum Helpers
+# --------------------------------------
+
+
+class Image(enum.Enum):
+    """
+    Docker image info.
+
+    Enum value:
+        foo = dockerfile_path, tag, context
+
+    """
+
+    web = "docker/base/Dockerfile", f"{PROJECT_SLUG}/web", "./docker/"
+
+    @classmethod
+    def choices(cls):
+        return [x.name for x in cls]
+
+
+class Container(enum.Enum):
+    """
+    Container info.
+
+    Enum value:
+        foo = container_name, default user
+
+    """
+
+    web = f"{PROJECT_SLUG}_web", "root"
+    db = f"{PROJECT_SLUG}_db", "postgres"
+
+    @classmethod
+    def choices(cls):
+        return [x.name for x in cls]
+
+
+
+# -------------------------------------
+# Utils
+# -------------------------------------
+# Helpers and utils.
+
+
+def get_random_secret_key(nbytes=32) -> str:
+    """
+    Return a random, secure string.
+
+    Notes:
+        - Extra encode is to ensure this value is actually url safe
+          despite what the token_urlsafe signature implies...
+
+    See:
+        - https://docs.python.org/3/library/secrets.html
+        - https://django-environ.readthedocs.io/en/latest/index.html?highlight=engine#tips
+
+    """
+    value = secrets.token_urlsafe(nbytes=nbytes)
+    url_encoded = parse.quote_plus(value)
+    return url_encoded
+
+
+def echo(*args, **kwargs):
+    """Wrap click.secho with some defaults."""
+
+    kwargs.setdefault("fg", "green")
+    kwargs.setdefault("bold", True)
+    click.secho(*args, **kwargs)
+
+
+@contextmanager
+def echo_complete(*args, **kwargs):
+    """Context wrapper to echo a message before and after a command runs."""
+
+    echo(*args, **kwargs)
+    yield
+    echo("Complete!")
+
+
+def run(*args, **kwargs) -> subprocess.CompletedProcess:
+    """Wrap subprocess.run with some defaults."""
+
+    kwargs.setdefault("check", True)
+    kwargs.setdefault("shell", True)
+    return subprocess.run(*args, **kwargs)
+
+
+def run_cmd(cmd, *args, **kwargs) -> subprocess.CompletedProcess:
+    """Wrap run with a default echo message wrapper."""
+
+    with echo_complete(f"Running: {cmd} ..."):
+        process = run(cmd, *args, **kwargs)
+
+    return process
+
+
+def replace_in_file(path: Path, old: str, new: str, count=1) -> None:
+    """Replace a string value in a file with another value."""
+    assert path.is_file()
+
+    with open(path) as file:
+        buffer = file.read()
+
+    buffer = buffer.replace(old, new, count)
+
+    with open(path, "w") as file:
+        file.write(buffer)
+
+
+def create_dot_env() -> Tuple[bool, Path]:
+    """Copy the env.dist file -> .env."""
+    dist_env = DJANGO.joinpath("env.dist")
+    dot_env = DJANGO.joinpath(".env")
+    created = False
+
+    # NOTE: No-op if env exists
+    if dot_env.exists():
+        return created, dot_env
+
+    shutil.copy(str(dist_env), str(dot_env))
+    created = True
+
+    return created, dot_env
+
+# Macros
+# -------------------------------------
+# Top-level commands and macros for lower-level commands.
+
+
+@cli.command(name="init")
+@click.confirmation_option(prompt="This will reset the DB! Continue?")
+@click.pass_context
+def init(ctx: click.Context) -> None:
+    """Initialize this project locally."""
+
+    ctx.forward(web_create_dot_env)
+    ctx.forward(web_install)
+    ctx.forward(db_init)
+    ctx.forward(web_init)
+    ctx.forward(install_pre_commit)
+
+
+@cli.command(name="build")
+@click.pass_context
+def build(ctx: click.Context) -> None:
+    """Build local images."""
+
+    ctx.invoke(docker_build, image_type="web")
+
+
+@cli.command(name="up")
+@click.pass_context
+def up(ctx: click.Context) -> None:
+    """Spin up local containers."""
+
+    run_cmd(f"docker-compose -p {PROJECT_SLUG} --log-level INFO up -d")
+
+
+@cli.command(name="down")
+@click.confirmation_option(
+    prompt=(
+        "This will destroy ALL project Docker container(s)!\n"
+        "Perhaps you meant `klak stop`\n"
+        "Continue?"
+    )
+)
+@click.pass_context
+def down(ctx: click.Context) -> None:
+    """Destroy local containers."""
+
+    run_cmd(f"docker-compose -p {PROJECT_SLUG} --log-level INFO down")
+
+
+@cli.command(name="stop")
+@click.pass_context
+def stop(ctx: click.Context) -> None:
+    """Stop local containers."""
+
+    run_cmd(f"docker-compose -p {PROJECT_SLUG} --log-level INFO stop")
+
+
+@cli.command(name="rm")
+@click.confirmation_option(
+    prompt="This will remove ALL project Docker image(s)! Continue?"
+)
+@click.pass_context
+def rm(ctx: click.Context) -> None:
+    """Remove project images."""
+
+    run_cmd(f"docker image rm {PROJECT_SLUG}/web", check=False)
+
+
+@cli.command(name="serve")
+@click.pass_context
+def serve(ctx: click.Context) -> None:
+    """Run the local development server."""
+
+    echo("Site is available at http://localhost:8000/")
+    ctx.invoke(django_admin, argv=["runserver 0.0.0.0:8000"])
+
+
+@cli.command(name="pytest")
+@click.pass_context
+def pytest(ctx: click.Context) -> None:
+    """Run the Python/Django test-suite."""
+
+    container, user = Container.web.value
+    run_cmd(f"docker exec -u {user} -it {container} pytest")
+
+
+@cli.command(name="migrate")
+@click.argument("argv", nargs=-1)
+@click.pass_context
+def migrate(ctx: click.Context, argv: List[str]) -> None:
+    """
+    Run the Django migrate process.
+
+    Example:    klak herkou migrate -- --no-input app_web
+
+    Note:       Use `--` to pass options (see example).
+
+    """
+
+    _argv = " ".join(argv)
+    ctx.invoke(django_admin, argv=[f"migrate {_argv}"])
+
+
+@cli.command(name="make_migrations")
+@click.argument("argv", nargs=-1)
+@click.pass_context
+def make_migrations(ctx: click.Context, argv: List[str]) -> None:
+    """
+    Make Django migrations.
+
+    Example:    klak herkou make_migrations -- --no-input app_web
+
+    Note:       Use `--` to pass options (see example).
+
+    """
+
+    _argv = " ".join(argv)
+    ctx.invoke(django_admin, argv=[f"makemigrations {_argv}"])
+
+
+
+# -------------------------------------
+# Pre-commit
+# -------------------------------------
+
+
+@cli.group(name="pre_commit")
+def pre_commit() -> None:
+    """Docker commands."""
+    pass
+
+
+@pre_commit.command(name="install")
+def install_pre_commit() -> None:
+    """Install pre-commit hooks."""
+
+    run_cmd(f"pre-commit install")
+
+
+@pre_commit.command(name="uninstall")
+def install_pre_commit() -> None:
+    """Uninstall pre-commit hooks."""
+
+    run_cmd(f"pre-commit uninstall")
+
+
+@pre_commit.command(name="run")
+@click.argument("argv", nargs=-1)
+def run_pre_commit(argv: List[str]) -> None:
+    """
+    Run pre-commit hooks.
+
+    Example:    klak pre_commit run -- flake8
+
+    Note:       Use `--` to pass options (see example).
+
+    """
+    _argv = " ".join(argv)
+    run_cmd(f"pre-commit run {_argv}")
+
+
+# -------------------------------------
+# Docker
+# -------------------------------------
+# Common docker tasks.
+#
+# Notes:
+#   - These tasks only wrap up very common operations.
+#     See the links below for more info
+#     about Docker and Docker Compose.
+#
+# See:
+#   - https://docs.docker.com/
+#   - https://docs.docker.com/compose/
+
+
+@cli.group(name="docker")
+def docker() -> None:
+    """Docker commands."""
+    pass
+
+
+@docker.command("run")
+@click.argument("container_type", type=click.Choice(Container.choices()))
+@click.argument("argv", nargs=-1)
+def docker_run(container_type: str, argv: List[str]) -> None:
+    """
+    Run a command on CONTAINER_TYPE.
+
+    Example:    klak docker run qa -- echo -n hi
+
+    Note:       Use `--` to pass options (see example).
+
+    """
+
+    container, user = Container[container_type].value
+    container_cmd = " ".join(argv)
+    run_cmd(f"docker exec -u {user} -it {container} {container_cmd}")
+
+
+@docker.command("build")
+@click.argument("image_type", type=click.Choice(Image.choices()))
+def docker_build(image_type: str) -> None:
+    """Build a Docker image for IMAGE_TYPE."""
+
+    dockerfile, tag, context = Image[image_type].value
+    run_cmd(f"docker build --rm -f {dockerfile} -t {tag} {context}")
+
+
+@docker.command("bash")
+@click.argument("container_type", type=click.Choice(Container.choices()))
+def docker_bash(container_type: str) -> None:
+    """Run an interactive bash session for CONTAINER_TYPE."""
+
+    container, user = Container[container_type].value
+    run_cmd(f"docker exec -u {user} -it {container} /bin/bash")
+
+
+# -------------------------------------
+# Django
+# -------------------------------------
+# Common Django tasks.
+#
+# Notes:
+#   - These tasks
+
+
+@cli.group(name="django")
+def django() -> None:
+    """Django commands."""
+
+    pass
+
+
+@django.command("admin")
+@click.argument("argv", nargs=-1)
+@click.pass_context
+def django_admin(ctx: click.Context, argv: List[str]) -> None:
+    """
+    Run a admin/manage.py command inside the web container.
+
+    Example:    klak django admin -- migrate --noinput
+
+    Note:       Use `--` to pass options (see example).
+
+    """
+
+    container, user = Container.web.value
+    _argv = " ".join(argv)
+    run_cmd(f"docker exec -u {user} -it {container} python manage.py {_argv}")
+
+
+# -------------------------------------
+# Postgres Commands
+# -------------------------------------
+# Common Postgres tasks.
+
+
+@cli.group(name="postgres")
+def postgres() -> None:
+    """Postgres commands."""
+
+    pass
+
+
+@postgres.command("create_postgis")
+def postgres_create_postgis() -> None:
+    """Create the postgis extension."""
+
+    container, user = Container.db.value
+    run_cmd(
+        f"docker exec -u {user} -it {container} psql -d postgres -c 'CREATE EXTENSION postgis;'"
+    )
+
+
+# -------------------------------------
+# DB Commands
+# -------------------------------------
+# Common tasks run against the db container.
+
+
+@cli.group(name="db")
+def db() -> None:
+    """DB image/container commands."""
+
+    pass
+
+
+@db.command("reset")
+@click.pass_context
+def db_reset(ctx: click.Context) -> None:
+    """
+    Reset the database to a clean state.
+
+    Note: This assumes Django is installed on the web contianer.
+
+    """
+
+    ctx.invoke(django_admin, argv=["reset_db --noinput"])
+    ctx.forward(postgres_create_postgis)
+
+
+@db.command("init")
+@click.pass_context
+def db_init(ctx: click.Context) -> None:
+    """Run database initialization tasks."""
+
+    ctx.forward(db_reset)
+
+
+# -------------------------------------
+# Web Commands
+# -------------------------------------
+# Common tasks run against the web container.
+
+
+@cli.group(name="web")
+def web() -> None:
+    """Web image/container commands."""
+
+    pass
+
+
+@web.command("create_dot_env")
+def web_create_dot_env() -> None:
+    """Create .env from env.dist and replace CHANGEME!!!."""
+
+    with echo_complete("Creating dot env ..."):
+        _, dot_env = create_dot_env()
+        secret_key = get_random_secret_key()
+        replace_in_file(dot_env, "CHANGEME!!!", secret_key)
+
+
+@web.command("install")
+def web_install() -> None:
+    """Run web installation tasks."""
+
+    container, user = Container.web.value
+    # NOTE: This ugly hack is here to work around
+    #       an error received when running `poetry install`
+    #       from inside the web container:
+    #
+    #       [OSError]
+    #       [Errno 8] Exec format error: '/usr/app/.venv/bin/python'
+    #
+    #       Moving the files to another dir and then running
+    #       `poetry install` seems to address the issue
+    #       but it is unclear what's causing it.
+    #
+    #       NOTE: This issue only affects local development.
+    run_cmd(
+        f"docker exec -u {user} -it {container} /bin/bash -c "
+        f"'"
+        f"cd /usr/app && "
+        f"cp pyproject.toml /tmp && "
+        f"cp poetry.lock /tmp &&"
+        f"cd /tmp && "
+        f"poetry install --no-interaction --no-ansi && "
+        f"rm poetry.lock pyproject.toml && "
+        f"cd -"
+        f"'"
+    )
+
+
+@web.command("init")
+@click.pass_context
+def web_init(ctx: click.Context) -> None:
+    """
+    Run web initialization tasks.
+
+    NOTE: This assumes Django is installed on the web container
+    and that the database is freshly reset.
+    Want to run migrations only? See `klak django --help`
+
+    """
+
+    with echo_complete("Creating dot env ..."):
+        _, dot_env = create_dot_env()
+        replace_in_file(dot_env, "CHANGEME!!!", get_random_secret_key())
+
+    ctx.invoke(django_admin, argv=["migrate --noinput"])
+
