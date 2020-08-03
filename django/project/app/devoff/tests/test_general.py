@@ -31,6 +31,7 @@ def test_encrypt_vuelta_type(client):
 
 
 def test_encrypt(client):
+    """Test that some example encrypt works."""
     body = {"mensaje": "Devoff se puso ATR", "vueltas": 4}
     response = client.post(
         reverse("devoff:encrypt"), data=body, content_type="application/json",
@@ -39,3 +40,39 @@ def test_encrypt(client):
     response_json = response.json()
     assert "mensaje" in response_json
     assert response_json["mensaje"] == "DfesTef oRv p osuA"
+
+
+def test_encrypt_2(client):
+    """Test that some example encrypt works."""
+    body = {"mensaje": "Devoff se puso ATR!.", "vueltas": 4}
+    response = client.post(
+        reverse("devoff:encrypt"), data=body, content_type="application/json",
+    )
+    assert response.status_code == 200
+    response_json = response.json()
+    assert "mensaje" in response_json
+    assert response_json["mensaje"] == "DfesTef oRv p !osuA."
+
+
+def test_decrypt(client):
+    """Test that some example decrypt works."""
+    body = {"mensaje": "DfesTef oRv p osuA", "vueltas": 4}
+    response = client.post(
+        reverse("devoff:decrypt"), data=body, content_type="application/json",
+    )
+    assert response.status_code == 200
+    response_json = response.json()
+    assert "mensaje" in response_json
+    assert response_json["mensaje"] == "Devoff se puso ATR"
+
+
+def test_decrypt_2(client):
+    """Test that some example decrypt works."""
+    body = {"mensaje": "DfesTef oRv p !osuA.", "vueltas": 4}
+    response = client.post(
+        reverse("devoff:decrypt"), data=body, content_type="application/json",
+    )
+    assert response.status_code == 200
+    response_json = response.json()
+    assert "mensaje" in response_json
+    assert response_json["mensaje"] == "Devoff se puso ATR!."
